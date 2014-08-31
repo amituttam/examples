@@ -14,6 +14,7 @@ class HashTable:
     def put(self, key, data):
         hashvalue = self.hashfunction(key, len(self.slots))
 
+        # Hit in first
         if self.slots[hashvalue] == None:
             self.slots[hashvalue] = key
             self.data[hashvalue] = data
@@ -21,6 +22,7 @@ class HashTable:
             # Replace data
             if self.slots[hashvalue] == key:
                 self.data[hashvalue] = data
+            # Collision
             else:
                 nextslot = self.rehash(hashvalue, len(self.slots))
                 while self.slots[nextslots] != None and self.slots[nextslots] != key:

@@ -15,4 +15,5 @@ def makeitalic(fn):
 def hello():
 	return "hello"
 
+# makebold(makeitalic(hello()))
 print(hello())
