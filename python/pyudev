@@ -1,0 +1,22 @@
+#!/usr/bin/python2.7
+
+import pyudev
+from time import sleep
+
+def handle_event(action, device):
+	print(action + " " + device.device_node)
+
+# MAIN
+context = pyudev.Context()
+
+# List all block devices
+for device in context.list_devices(subsystem='block', DEVTYPE='disk'):
+	print(device.device_node)
+
+# Monitor devices
+monitor = pyudev.Monitor.from_netlink(context)
+monitor.filter_by('block', device_type='disk')
+observer = pyudev.MonitorObserver(monitor, handle_event)
+observer.start()
+sleep(60)
+observer.stop()

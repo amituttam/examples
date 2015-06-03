@@ -1,0 +1,332 @@
+#!/usr/bin/python2.7
+
+import sys
+import glob
+import dbus
+import avahi
+import signal
+import logging
+from time import sleep
+from os.path import basename
+import rtslib.root as root
+from rtslib.utils import RTSLibError, modprobe
+from rtslib.utils import is_dev_in_use, get_block_type, get_main_ip
+from rtslib.tcm import IBlockBackstore, IBlockStorageObject
+from rtslib.target import FabricModule, Target, TPG, LUN, NetworkPortal, \
+		NodeACL, MappedLUN
+
+# Global
+exports = []
+FORMAT = '%(asctime)s %(message)s'
+logging.basicConfig(format=FORMAT,
+		level=logging.DEBUG,
+		filename='/var/log/iscsi-export.log')
+log = logging.getLogger('iscsi-export')
+rtsroot = root.RTSRoot()
+
+class IscsiTargetService:
+	"A simple class to publish an ISCSI Target service using ZeroConf"
+
+	def __init__(self, dev):
+		log.info("Creating new IscsiTargetService('%s')" % dev)
+		self.dev = dev
+
+	def add_export(self, fabric):
+		dev = self.dev
+		ip = get_main_ip()
+
+		# Check networking
+		if not ip:
+			log.warn("No IP address found!")
+			return 0
+
+		# Add the device(s) found as an iblock storage object
+		backstore, iblock = add_iblock(dev)
+		if not iblock:
+			return 0
+
+		# Create the iscsi target
+		target = create_iscsi_target(dev, fabric)
+		if not target:
+			return 0
+
+		# Create the TPG
+		tpg = add_tpg_to_target(target)
+		if not tpg:
+			return 0
+
+		# Create the LUN
+		lun = add_lun_to_tpg(tpg, iblock)
+		if not lun:
+			return 0
+
+		# Create the network portal
+		portal = add_portal_to_tpg(tpg, ip)
+		if not portal:
+			return 0
+
+		# Create the ACL
+		acl = add_acl_to_tpg(tpg)
+		if not acl:
+			return 0
+
+		# Set up username and password
+		acl.chap_userid = 'logicube'
+		acl.chap_password = caesar_encode(target.wwn, 4)
+
+		# Map the LUN to the initiator node. Allows the initiator to
+		# access the LUN
+		mapped_lun = add_mapped_lun_to_acl(acl, lun)
+		if not mapped_lun:
+			return 0
+
+		# Save some useful objects
+		self.target = target
+		self.backstore = backstore
+		self.ip = ip
+
+		log.info("'%s' exported via iSCSI successfully\n" % dev)
+
+		return 1
+
+	def del_export(self):
+		target = self.target
+		backstore = self.backstore
+
+		# Delete target
+		try:
+			target.delete()
+		except RTSLibError, error:
+			log.error("Error removing target (%s)" % str(error))
+		else:
+			log.info("Successfully removed target '%s'" % target.path)
+
+		# Delete backstore
+		try:
+			backstore.delete()
+		except RTSLibError, error:
+			log.error("Error removing backstore (%s)" % str(error))
+		else:
+			log.info("Successfully removed backstore '%s'" % backstore.path)
+
+	def publish(self):
+		bus = dbus.SystemBus()
+		server = dbus.Interface(bus.get_object(avahi.DBUS_NAME, avahi.DBUS_PATH_SERVER),
+			avahi.DBUS_INTERFACE_SERVER)
+		g = dbus.Interface(bus.get_object(avahi.DBUS_NAME, server.EntryGroupNew()),
+			avahi.DBUS_INTERFACE_ENTRY_GROUP)
+		name = "ISCSI Target (%s) on %s" % (self.dev, self.ip)
+		stype = "_iscsi-target._tcp"
+		domain = ""
+		host = ""
+		log.info("Publishing service %s" % name)
+		g.AddService(avahi.IF_UNSPEC, avahi.PROTO_UNSPEC, dbus.UInt32("0"), name, stype, domain, host, dbus.UInt16("3260"), self.dev)
+		g.Commit()
+		self.group = g
+
+	def unpublish(self):
+		if not self.group is None:
+			self.group.Reset()
+
+def sig_handler(signum, frame):
+	log.critical("Signal handler called with signal (%d)" % signum)
+	log.info("Cleaning up")
+
+	# Remove all exports
+	for export in exports:
+		export.del_export()
+		export.unpublish()
+
+	sys.exit(0)
+
+def get_next_index():
+	index = -1
+
+	for backstore in rtsroot.backstores:
+		index = backstore.index
+
+	index = int(index) + 1
+	log.info("Next index is '%d'" % index)
+	return index
+
+def list_devs():
+	devs = []
+
+	for dev in glob.glob('/dev/sd[a-z]'):
+		log.debug("Check if '%s' is a valid device" % dev)
+
+		if is_dev_in_use(dev):
+			log.debug("'%s' is in use" % dev)
+			continue
+
+		if get_block_type(dev) == 0:
+			# Try and open it
+			try:
+				fd = open(dev, 'r')
+			except IOError:
+				log.debug("'%s' is not a valid medium" % dev)
+				continue
+			else:
+				log.info("'%s' can be used as a storage backend" % dev)
+				devs.append(dev)
+				fd.close()
+
+	return devs
+
+def load_iscsi_fabric():
+	log.info("Loading iscsi fabric module")
+
+	try:
+		fabric = FabricModule('iscsi')
+		for step in fabric.load(yield_steps=True):
+			(action, taken, desc) = step
+			if taken:
+				log.info(desc)
+			log.info("Done loading %s fabric module" % fabric.name)
+	except RTSLibError, error:
+		log.error("Error loading iSCSI fabric module (%s)" % str(error))
+		return None
+	else:
+		return fabric
+
+def add_iblock(dev):
+	log.info("Adding '%s' as iblock storage object" % dev)
+
+	index = get_next_index()
+	try:
+		backstore = IBlockBackstore(index, mode='create')
+	except RTSLibError, error:
+		log.error("Error creating IBlockBackstore object (%s)" % str(error))
+		return None, None
+	else:
+		try:
+			storage_object = IBlockStorageObject(backstore, "block%d" % index, dev, True)
+		except RTSLibError, error:
+			log.error("Error creating IBlockStorageObject (%s)" % str(error))
+			return backstore, None
+		else:
+			log.info("Successfully added '%s' as iblock", dev)
+			return backstore, storage_object
+
+def create_iscsi_target(dev, fabric):
+	log.info("Adding '%s' as iscsi target" % dev)
+
+	wwn = "iqn.2012-09.com.logicube.zclone-live:" + basename(dev)
+
+	try:
+		target = Target(fabric, wwn=wwn, mode='create')
+	except RTSLibError, error:
+		log.error("Error creating target (%s)" % str(error))
+		return None 
+	else:
+		log.info("Successfully added '%s' as iscsi target" % dev)
+		return target
+
+def add_tpg_to_target(target):
+	log.info("Creating TPG")
+
+	try:
+		tpg = TPG(target, 1, mode='create')
+	except RTSLibError, error:
+		log.error("Error creating TPG (%s)" % str(error))
+		return None
+	else:
+		log.info("Successfully created TPG")
+		tpg._set_enable(True)
+		return tpg
+
+def add_lun_to_tpg(tpg, iblock):
+	log.info("Creating LUN")
+
+	# Create a LUN attached to tpg and mapped to storage object
+	# *iblock*
+	try:
+		lun = LUN(tpg, 0, storage_object=iblock, alias=None)
+	except RTSLibError, error:
+		log.error("Error creating LUN (%s)" % str(error))
+		return None
+	else:
+		log.info("Successfully created LUN")
+		return lun
+
+def add_portal_to_tpg(tpg, ip):
+	log.info("Creating Network Portal")
+
+	# Create a Network Portal attached to TPG
+	try:
+		portal = NetworkPortal(tpg, ip, port=3260, mode='create')
+	except RTSLibError, error:
+		log.error("Error creating portal (%s)" % str(error))
+		return None
+	else:
+		log.info("Successfully created Network Portal")
+		return portal
+
+def add_acl_to_tpg(tpg):
+	log.info("Creating ACL for ZClone initiator")
+
+	# Create an ACL for ZClone initiator attached to TPG
+	try:
+		iqn = "iqn.2012-09.com.logicube.zclone:initiator"
+		acl = NodeACL(tpg, iqn, mode='create')
+	except RTSLibError, error:
+		log.error("Error creating ACL (%s)" % str(error))
+		return None
+	else:
+		log.info("Successfully created ACL")
+		return acl
+
+def add_mapped_lun_to_acl(acl, lun):
+	log.info("Mapping LUN to ACL")
+
+	# Map the LUN to the ACL
+	try:
+		acl = MappedLUN(acl, 0, tpg_lun=lun, write_protect=False)
+	except RTSLibError, error:
+		log.error("Error creating Mapped LUN (%s)" % str(error))
+		return None
+	else:
+		log.info("Successfully created Mapped LUN")
+		return acl
+
+def caesar_encode(string, shift):
+	cipher = ""
+	for c in string:
+		if c.isalpha():
+			cipher_char = ord(c) + shift
+			if cipher_char > ord('z'):
+				cipher_char -= 26
+			final_char = chr(cipher_char)
+			cipher += final_char
+	log.info("Cipher text: " + cipher)
+	return cipher
+
+def main():
+
+	# Set up signal handlers
+	log.info("Setting up signal handler")
+	for sig in [signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT]:
+		signal.signal(sig, sig_handler)
+
+	# Add the iSCSI fabric
+	fabric = load_iscsi_fabric()
+	if not fabric:
+		log.critical("Could not load iSCSI fabric module, exiting daemon")
+		sys.exit(1)
+
+	# Check networking
+	ip = get_main_ip()
+	if not ip:
+		log.warn("No IP address found!")
+		sys.exit(1)
+
+	# Add already plugged in devices
+	devs = list_devs()
+	for dev in devs:
+		export = IscsiTargetService(dev)
+		if export.add_export(fabric):
+			export.publish()
+			exports.append(export)
+
+if __name__ == '__main__':
+	main()
