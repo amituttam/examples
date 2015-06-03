@@ -1,0 +1,28 @@
+global cpu
+global time
+global cycles
+
+probe begin
+{
+	printf ("Starting trace\n")
+}
+
+probe process("./sha1").library("/usr/lib/x86_64-linux-gnu/libcrypto.so.1.0.0").function("SHA1_Update").call
+{
+	cycles = get_cycles();
+	cpu = cpu();
+	time = cpu_clock_ns(cpu);
+	printf ("SHA1_Update called\n")
+	printf ("cpu: %d time: %d\n", cpu, time);
+}
+
+probe process("./sha1").statement("*@sha1.c:66")
+{
+	cycles_now = get_cycles();
+	cpu = cpu();
+	time_now = cpu_clock_ns(cpu);
+	printf ("SHA1_Update done\n")
+	printf ("cpu: %d time_now: %d\n", cpu, time_now);
+	printf ("delta ns: %d\n", time_now - time)
+	printf ("delta cycles: %d\n", cycles_now - cycles);
+}
